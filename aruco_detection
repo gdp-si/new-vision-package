@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""ROS2 service for ArUco detection."""
+import cv2
+import rclpy
+from cv_bridge import CvBridge
+from roast_interfaces.srv import DetectAruco
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+
+from roast import RobotProfile
+
+
+# FIXME: Check if the threadpool still exists after the service succeeds
+class ArucoDetection(Node):
+    def __init__(self):
+        super().__init__("aruco_detection")
+
+        # Create service
+        self._service = self.create_service(
+            DetectAruco, "detect_aruco", self._service_callback
+        )
+
+        # Create ArUco detection instance
+        self._executor = MultiThreadedExecutor()
+        self._marker_id = RobotProfile.ARUCO_ID
+
+    def _service_callback(
+        self, request: DetectAruco.Request, response: DetectAruco.Response
+    ):
+        """Service callback."""
+
+        timeout = request.timeout if request.timeout else 5
+        image_topic = request.image_topic if request.image_topic else ""
+
+        if not image_topic:
+            response.success = False
+            return response
+
+        timeout = self.get_clock().now().nanoseconds + timeout * 1e9
+        self._executor.wake()
+
+        aruco_detection_instance = ArucoDetectionInstance(
+            image_topic, self._marker_id, timeout
+        )
+        self._executor.add_node(aruco_detection_instance)
+        while rclpy.ok():
+            self._executor.spin_once()
+
+            if self.get_clock().now().nanoseconds > timeout:
+                break
+
+            if aruco_detection_instance._is_aruco_detected:
+                break
+
+        response.success = aruco_detection_instance._is_aruco_detected
+        self._executor.remove_node(aruco_detection_instance)
+
+        return response
+
+
+class ArucoDetectionInstance(Node):
+    """ROS2 service for ArUco detection."""
+
+    def __init__(self, image_topic: str, marker_id: int, timeout: int):
+        """Initialize node."""
+        super().__init__("aruco_detection_instance")
+
+        self._bridge = CvBridge()
+
+        self._aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        self._detector = cv2.aruco.ArucoDetector(self._aruco_dict)
+
+        self._image_sub = self.create_subscription(
+            Image, image_topic, self._image_callback, 10
+        )
+
+        # Initialize variables
+        self._is_aruco_detected = False
+        self._new_image = False
+        self._elapsed_time = 0
+        self._timeout = self.get_clock().now().nanoseconds + timeout * 1e9
+        self._marker_id = marker_id
+
+    def _image_callback(self, msg):
+        """Image subscriber callback."""
+        image = self._bridge.imgmsg_to_cv2(msg, "bgr8")
+        # Image padding to white color
+        image = cv2.copyMakeBorder(
+            image, 100, 100, 100, 100, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+
+        _, ids, _ = self._detector.detectMarkers(image)
+
+        # Check if ArUco is detected
+        if ids is not None and self._marker_id in ids:
+            self._is_aruco_detected = True
+            self.get_logger().info("Aruco detected: {}".format(self._is_aruco_detected))
+
+
+def main(args=None):
+    """Main function."""
+    rclpy.init(args=args)
+    node = ArucoDetection()
+    # node = ArucoDetectionInstance("image_raw", 10, 50)
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
